@@ -1,7 +1,7 @@
 """Bounded durable staging; staging never queues processing."""
 import hashlib,json,time,uuid
 from pathlib import Path
-from .store import CONFIG_VERSION
+from .store import import_fingerprints
 from .pipeline import atomic_json
 
 class FolderImport:
@@ -30,9 +30,10 @@ class FolderImport:
    h=hashlib.sha256()
    with path.open('rb') as f:
     for b in iter(lambda:f.read(1024*1024),b''):h.update(b)
-   fingerprint=hashlib.sha256((h.hexdigest()+CONFIG_VERSION+'_recognition-v1_'+recognition_mode).encode()).hexdigest()
-   matches=[j for j in self.store.list() if j['fingerprint']==fingerprint]
-   item={'id':uuid.uuid4().hex,'name':str(name)[:1000],'fingerprint':fingerprint,'matches':matches,'created':time.time(),'recognition_mode':recognition_mode}
+   if (self.store.root/'deletions'/(h.hexdigest()+'.blocked')).exists():raise ValueError('此视频此前已删除，已跳过重复录入')
+   fingerprints=import_fingerprints(h.hexdigest(),recognition_mode)
+   matches=self.store.import_matches(fingerprints)
+   item={'id':uuid.uuid4().hex,'name':str(name)[:1000],'fingerprint':fingerprints[0],'fingerprints':fingerprints,'matches':matches,'created':time.time(),'recognition_mode':recognition_mode}
    video=self.root/(item['id']+'.video');meta=video.with_suffix('.json')
    path.replace(video)
    try:atomic_json(meta,item)
@@ -47,14 +48,13 @@ class FolderImport:
  def pending(self):
   """Recover unsubmitted browser manifests without queuing or expiring files."""
   with self.store.lock:
-   by_fingerprint={}
-   for job in self.store.list():by_fingerprint.setdefault(job['fingerprint'],[]).append(job)
    items=[]
    for path in sorted(self.root.glob('*.json'),key=lambda p:p.name):
     try:
      item=json.loads(path.read_text())
      if 'action' in item or 'result' in item or not path.with_suffix('.video').is_file():continue
-     items.append({'id':item['id'],'name':item['name'],'created':item['created'],'recognition_mode':item.get('recognition_mode','legacy_audio'),'matches':by_fingerprint.get(item['fingerprint'],[])})
+     matches=self.store.import_matches(item.get('fingerprints',[item['fingerprint']]))
+     items.append({'id':item['id'],'name':item['name'],'created':item['created'],'recognition_mode':item.get('recognition_mode','legacy_audio'),'matches':matches})
     except (OSError,ValueError,KeyError,TypeError):continue
    return sorted(items,key=lambda i:(i['created'],i['id']))
  def cancel(self,ticket):
@@ -66,8 +66,9 @@ class FolderImport:
  def _overwrite_target(self,item,old_id):
   old=self.store.get(old_id)
   safe=('ready','published','failed','interrupted','publish_failed','refresh_failed','needs_manual')
-  if any(j['fingerprint']==item['fingerprint'] and j['status'] not in safe for j in self.store.list()):raise ValueError('相同内容有运行中、排队或待核对任务，不能覆盖')
-  if old['fingerprint']!=item['fingerprint']:raise ValueError('覆盖目标内容不匹配')
+  fingerprints=item.get('fingerprints',[item['fingerprint']])
+  if any(j['status'] not in safe for j in self.store.import_matches(fingerprints)):raise ValueError('相同内容有运行中、排队或待核对任务，不能覆盖')
+  if old['fingerprint'] not in fingerprints:raise ValueError('覆盖目标内容不匹配')
   if old['status'] not in ('ready','published','failed','interrupted','publish_failed','refresh_failed','needs_manual'):raise ValueError('旧任务运行中或写入待核对，不能覆盖')
   return old
  def prepare(self,ticket,old_id):
@@ -94,7 +95,7 @@ class FolderImport:
    item['prepared']={'check_id':check_id,'old_id':old_id,'plan':plan}
    atomic_json(self.root/(ticket+'.json'),item)
    return {'check_id':check_id}
- def commit(self,ticket,action,old_id=None,check_id=None,credential_available=True):
+ def commit(self,ticket,action,old_id=None,check_id=None,credential_available=True,*,skip_existing=False):
   with self.store.lock:
    item=self.read(ticket)
    if action=='overwrite':
@@ -116,9 +117,10 @@ class FolderImport:
      raise ValueError('旧任务关联页面已改变，请重新核验')
    if 'action' not in item:
     if plan and not credential_available:plan=dict(plan,baseline_error='提交时缺少 Notion 凭证，本地结果已保留')
-    item.update(action=action,old_id=old_id,plan=plan)
+    duplicate=action=='new' and skip_existing and bool(self.store.import_matches(item.get('fingerprints',[item['fingerprint']])))
+    item.update(action=action,old_id=old_id,plan=plan,duplicate=duplicate)
     atomic_json(self.root/(ticket+'.json'),item)
-   if action=='skip':result={'skipped':True}
+   if action=='skip' or item.get('duplicate'):result={'skipped':True}
    else:
     jid=ticket
     folder=self.store.root/'jobs'/jid;folder.mkdir(exist_ok=True)

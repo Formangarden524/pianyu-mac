@@ -5,7 +5,7 @@ async function loadQueueProgress(){
  const q=s=>document.querySelector(s);
  try{
   const p=await api('/api/progress');
-  const fields={total:'任务记录',needs_manual:'待选择模式',completed:'文案已完成',queued:'排队中',processing:'转录／整理',writing:'写入中',published:'已写入 Notion',ready:'待写入确认',failed:'失败／中断',needs_review:'写入待核对'};
+  const fields={total:'任务记录',needs_manual:'待选择模式',completed:'文案已完成',queued:'排队中',processing:'转录／整理',writing:'写入中',published:'已写入 Notion',ready:'待自动同步',failed:'失败／中断',needs_review:'写入待核对'};
   p.completed=p.ready+p.published;
   const counts=q('#queue-progress-counts');
   for(const [key,label] of Object.entries(fields)){

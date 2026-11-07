@@ -55,9 +55,9 @@ class NotionClient:
         tags=validate_tags(tags)
         source=self.request('GET','/data_sources/'+target['id']);schema=source.get('properties',{})
         properties={}
-        for key,aliases in [('primary',('主标签','1级标签','一级标签')),('secondary',('二级标签','2级标签'))]:
+        for key,aliases in [('primary',('主题大类',)),('secondary',('主题细分',))]:
             names=[name for name in aliases if name in schema]
-            if len(names)!=1:raise ValueError('数据库需有明确的主标签与二级标签字段，请检查字段名称')
+            if len(names)!=1:raise ValueError('数据库需有明确的主题大类与主题细分字段，请检查字段名称')
             name=names[0];kind=schema[name].get('type')
             if kind not in ('select','multi_select'):raise ValueError('数据库标签字段必须为选择或多选类型：'+name)
             value={'name':tags[key]};properties[name]={kind:[value] if kind=='multi_select' else value}

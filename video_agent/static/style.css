@@ -33,3 +33,6 @@
 #recognition-decision-note{margin:12px 22px;color:#687b9b;line-height:1.8}
 
 .queue-mode-toolbar{padding:12px 16px;border-bottom:1px solid #e6eaf2;display:flex;flex-wrap:wrap;gap:8px;align-items:center}.queue-mode-toolbar label{display:flex;gap:8px;align-items:center}.queue-mode-toolbar p{font-size:12px;color:#65748b;flex-basis:100%;margin:0;overflow-wrap:anywhere}
+
+/* Publishing follows the saved import policy; no per-task confirmation controls. */
+#publish,#queue-publish,#queue-unpublished{display:none!important}

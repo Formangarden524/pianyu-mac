@@ -7,6 +7,9 @@ from fastapi.responses import FileResponse,JSONResponse,Response
 from fastapi.staticfiles import StaticFiles
 from .chinese import simplified_result
 from .auto_publish import choose_action
+from .authors import local_author,author_properties
+from .deletion import Deletion
+from .library import Library
 from .store import Store
 from .content import ContentService
 from .batch import BatchService
@@ -34,7 +37,7 @@ def create_app(root=None,worker=True,vault=None,notion_factory=None):
     credential_error=''
     try:persisted_token=vault.load()
     except CredentialError as e:persisted_token='';credential_error=str(e)
-    config={'token':os.environ.get('NOTION_TOKEN','') or persisted_token,'kind':saved.get('kind','page'),'target':saved.get('target',os.environ.get('NOTION_TARGET','')),'resolved':None,'auto_publish':saved.get('auto_publish',True),'duplicate_policy':saved.get('duplicate_policy','skip')}
+    config={'token':os.environ.get('NOTION_TOKEN','') or persisted_token,'kind':saved.get('kind','page'),'target':saved.get('target',os.environ.get('NOTION_TARGET','')),'resolved':None,'auto_publish':True,'duplicate_policy':saved.get('duplicate_policy','skip')}
     def snapshot():
         nonlocal credential_error
         with config_lock:
@@ -54,6 +57,12 @@ def create_app(root=None,worker=True,vault=None,notion_factory=None):
         except (NotionError,ValueError):plan['baseline_error']='提交时无法核验原页面，本地结果已保留'
         finally:client.close()
     folder_import=FolderImport(store,capture)
+    def deletion_client():
+        cfg=snapshot()
+        if not cfg['token']:raise ValueError('请先配置Notion连接')
+        return make_notion(cfg['token'])
+    deletion=Deletion(store,deletion_client)
+    library=Library(store)
     content=ContentService(store)
     batches=BatchService(store,capture=capture)
     def worker_loop():
@@ -96,6 +105,14 @@ def create_app(root=None,worker=True,vault=None,notion_factory=None):
                                     store.update(job['id'],status='ready',detail='检测到已有记录，请重新选择覆盖、不写入或新增');continue
                                 if target['kind']=='data_source':result=ensure_tags(store,job,result)
                                 client.publish(store,job,target,result)
+                        author=local_author(store,job['id']);written=store.get(job['id'])
+                        if author and written.get('page_id'):
+                            try:
+                                author_target=old['target'] if refreshing else target
+                                if author_target['kind']=='data_source':
+                                    schema=client.request('GET','/data_sources/'+author_target['id']).get('properties',{})
+                                    client.request('PATCH','/pages/'+written['page_id'],{'properties':author_properties(schema,author)})
+                            except (NotionError,ValueError):store.update(job['id'],detail='正文已写入，作者账号同步需重试',error='作者账号未同步，请检查字段或连接')
                     finally:client.close()
                 else:
                     auto=root/'jobs'/job['id']/'automatic-overwrite.json'
@@ -133,7 +150,7 @@ def create_app(root=None,worker=True,vault=None,notion_factory=None):
                 message=str(e) if isinstance(e,(ValueError,RuntimeError)) else '处理失败，请检查模型服务、依赖或文件；已有阶段已保留'
                 cfg=snapshot()
                 if cfg['token']:message=message.replace(cfg['token'],'[已隐藏]')
-                store.update(job['id'],status='refresh_failed' if refreshing else ('publish_uncertain' if publishing else 'failed'),error=message[:500],detail='更新失败，可继续' if refreshing else ('写入结果待核对' if publishing else '处理失败，可重试'))
+                store.update(job['id'],status='refresh_failed' if refreshing else (('publish_failed' if isinstance(e,ValueError) and not any((root/'jobs'/job['id']/name).exists() for name in ('notion-journal.json','notion-overwrite.json')) else 'publish_uncertain') if publishing else 'failed'),error=message[:500],detail='更新失败，可继续' if refreshing else ('写入结果待核对' if publishing else '处理失败，可重试'))
     @contextlib.asynccontextmanager
     async def lifespan(app):
         thread=None;handle=None
@@ -166,11 +183,32 @@ def create_app(root=None,worker=True,vault=None,notion_factory=None):
         try:return store.get(jid)
         except KeyError:raise HTTPException(404,'任务不存在')
     @app.get('/')
-    def index():return FileResponse(STATIC/'index.html')
+    def index():return FileResponse(STATIC/'library.html')
+    @app.get('/advanced')
+    def advanced():return FileResponse(STATIC/'index.html')
     @app.get('/api/health')
     def health():
         weights=any((MODEL/n).exists() for n in ('weights.npz','weights.safetensors'))
         return {'active_card_tasks':content.pending(),'queue_batch_enabled':True,'content_tools_enabled':True,'folder_import_enabled':True,'asr_ready':(MODEL/'config.json').exists() and weights,'model':'pianyu-instruct','upload_limit_gib':2,'data_directory':str(root),'notion_configured':bool(snapshot()['token'])}
+    @app.post('/api/jobs/{jid}/delete/check')
+    def deletion_check(jid:str):
+        try:return deletion.prepare(jid)
+        except (ValueError,KeyError) as e:raise HTTPException(409,str(e))
+    @app.post('/api/deletions/{id}/commit')
+    def deletion_commit(id:str):
+        try:return deletion.commit(id)
+        except (ValueError,KeyError,OSError,NotionError) as e:raise HTTPException(409,'删除未全部完成，可用同一批次重试：'+str(e))
+    @app.get('/api/library')
+    def list_library(q:str='',tag:str='',sort:str='new',favorite:bool=False,author:str='',offset:int=0,limit:int=30):
+        if sort not in ('new','old','title') or offset<0 or not 1<=limit<=100:raise HTTPException(400,'查询参数无效')
+        return library.list(q[:2000],tag,sort,favorite,author,offset,limit)
+    @app.post('/api/library/{id}/metadata')
+    async def library_metadata(id:str,request:Request):
+        data=await request.json()
+        if not isinstance(data,dict):raise HTTPException(400,'请求格式无效')
+        try:return library.save(id,data.get('fields'),data.get('version'))
+        except KeyError:raise HTTPException(404,'内容不存在')
+        except ValueError as e:raise HTTPException(409,str(e))
     @app.get('/api/jobs')
     def jobs():return store.visible_list()
     @app.get('/api/progress')
@@ -191,7 +229,15 @@ def create_app(root=None,worker=True,vault=None,notion_factory=None):
                     if total>MAX_UPLOAD:raise HTTPException(413,'单个视频上限2GiB')
                     f.write(chunk)
             if not total:raise HTTPException(400,'文件为空')
-            return await asyncio.to_thread(store.import_file,path,name,mode)
+            try:
+                job=await asyncio.to_thread(store.import_file,path,name,mode,dedupe_source=True)
+                author=unquote(request.headers.get('x-author','')).strip()[:200]
+                if author and not job['duplicate']:
+                    with store.lock:
+                        meta=library.metadata(job['id'])
+                        if not meta.get('author'):library.save(job['id'],{'author':author},meta['version'])
+                return job
+            except ValueError as e:raise HTTPException(409,str(e))
         finally:path.unlink(missing_ok=True)
     @app.post('/api/folder/stage')
     async def folder_stage(request:Request):
@@ -216,7 +262,15 @@ def create_app(root=None,worker=True,vault=None,notion_factory=None):
     async def folder_commit(ticket:str,request:Request):
         data=await request.json()
         if not data.get('confirmed'):raise HTTPException(409,'请确认覆盖会自动更新关联Notion页面')
-        try:return await asyncio.to_thread(folder_import.commit,ticket,data.get('action'),data.get('old_id'),data.get('check_id'),bool(snapshot()['token']))
+        try:
+            staged=folder_import.read(ticket)
+            result=await asyncio.to_thread(folder_import.commit,ticket,data.get('action'),data.get('old_id'),data.get('check_id'),bool(snapshot()['token']),skip_existing=data.get('skip_existing') is True)
+            author=Path(staged['name']).parent.name
+            if author and author!='.' and isinstance(result,dict) and result.get('id'):
+                with store.lock:
+                    meta=library.metadata(result['id'])
+                    if not meta.get('author'):library.save(result['id'],{'author':author},meta['version'])
+            return result
         except (ValueError,KeyError) as e:raise HTTPException(409,str(e))
     @app.delete('/api/folder/{ticket}')
     def folder_cancel(ticket:str):
@@ -276,6 +330,11 @@ def create_app(root=None,worker=True,vault=None,notion_factory=None):
         get_job(jid)
         try:return store.retry(jid)
         except ValueError as e:raise HTTPException(409,str(e))
+    @app.get('/api/jobs/{jid}/video')
+    def source_video(jid:str):
+        job=get_job(jid);path=root/'jobs'/job['id']/'source.video'
+        if not path.is_file():raise HTTPException(404,'原视频不存在')
+        return FileResponse(path,media_type='video/mp4',headers={'Accept-Ranges':'bytes'})
     @app.get('/api/jobs/{jid}/download/{kind}')
     def download(jid:str,kind:str):
         job=get_job(jid);mapping={'original':'transcript.txt','clean':'clean.txt','srt':'transcript.srt','json':'result.json'}
@@ -309,7 +368,7 @@ def create_app(root=None,worker=True,vault=None,notion_factory=None):
             except CredentialError as e:raise HTTPException(503,str(e))
             credential_error=''
             config['kind']=data.get('kind',config['kind']);config['target']=str(data.get('target',config['target'])).strip();config['resolved']=None
-            config['auto_publish']=data.get('auto_publish',config['auto_publish']);config['duplicate_policy']=data.get('duplicate_policy',config['duplicate_policy'])
+            config['auto_publish']=True;config['duplicate_policy']=data.get('duplicate_policy',config['duplicate_policy'])
             atomic_json(settings_path,{k:config[k] for k in ('kind','target','auto_publish','duplicate_policy')})
         return public_config()
     @app.post('/api/settings/test')

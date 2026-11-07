@@ -57,14 +57,14 @@ def speech_pilot(folder,runner):
 
 def classify_evidence(visual,speech):
  import httpx
- r=httpx.post('http://127.0.0.1:11434/api/chat',json={'model':'pianyu-instruct','stream':False,'keep_alive':0,'format':'json','messages':[{'role':'user','content':'根据以下实际OCR和30秒试转录判断类型。音乐、无意义重复或幻觉不算讲话。只返回JSON mode(audio/visual/demo/unknown),confidence(0到1),reason。visual为静态文字，demo为操作演示且语音与画面互补。证据不足unknown。\n'+json.dumps({'frames':visual,'speech':speech},ensure_ascii=False)}],'options':{'num_ctx':8192,'num_predict':512,'temperature':0}},timeout=600,trust_env=False)
+ r=httpx.post('http://127.0.0.1:11434/api/chat',json={'model':'pianyu-instruct','stream':False,'keep_alive':0,'format':{'type':'object','properties':{'mode':{'type':'string','enum':['audio','unknown'] if speech else ['visual','unknown']},'confidence':{'type':'number','minimum':0,'maximum':1},'reason':{'type':'string'}},'required':['mode','confidence','reason'],'additionalProperties':False},'messages':[{'role':'user','content':'根据以下实际OCR和30秒试转录判断类型。音乐、无意义重复或幻觉不算讲话。frames为空时只判断speech是否为真实有意义口播，是则audio，否则unknown；speech为空时仅有可靠画面文字才返回visual，不得返回demo。只返回JSON mode(audio/visual/demo/unknown),confidence(0到1),reason。visual为静态文字，demo为操作演示且语音与画面互补。证据不足unknown。\n'+json.dumps({'frames':visual,'speech':speech},ensure_ascii=False)}],'options':{'num_ctx':8192,'num_predict':512,'temperature':0}},timeout=600,trust_env=False)
  r.raise_for_status()
  try:decision=json.loads(r.json()['message']['content'])
  except (ValueError,KeyError):raise NeedsManual('类型判断返回无效结果')
  if not isinstance(decision,dict):raise NeedsManual('类型判断结果不是有效对象')
  mode=decision.get('mode')
  if mode not in ('audio','visual','demo') or not isinstance(decision.get('confidence'),(int,float)) or isinstance(decision['confidence'],bool) or not math.isfinite(decision['confidence']) or not .85<=decision['confidence']<=1:raise NeedsManual(str(decision.get('reason','类型判断不确定')))
- if mode in ('audio','demo') and len(speech.strip())<20:raise NeedsManual('缺少可靠讲话证据')
+ if mode in ('audio','demo') and len(speech.strip())<2:raise NeedsManual('缺少可靠讲话证据')
  if mode in ('visual','demo') and not visual:raise NeedsManual('缺少可靠画面证据')
  return decision
 
@@ -82,12 +82,22 @@ def recognize(job,folder,runner):
  if mode=='legacy_audio':return None
  selected=mode;decision={'reason':'按指定模式识别'};segments=[]
  if mode=='auto':
-  pilot=visual_segments(folder/'source.video',folder/'frames',runner,representative=True)
-  atomic_json(folder/'recognition.json',{'requested_mode':mode,'preflight_evidence':pilot,'reason':'正在核验音频与类型'})
+  atomic_json(folder/'recognition.json',{'requested_mode':mode,'reason':'优先核验口播','rule_version':'audio-first-v1'})
   speech=speech_pilot(folder,runner)
-  decision=classify_evidence(pilot,speech);selected=decision['mode']
-  decision['preflight_evidence']=pilot
-  decision['coverage']={'preflight_frames':'start, middle, end','speech_seconds':30}
+  decision=None
+  if speech.strip():
+   try:
+    candidate=classify_evidence([],speech)
+    if candidate['mode'] in ('audio','demo'):decision={**candidate,'mode':'audio','reason':'检测到可靠口播，只使用语音，不合并画面字幕'}
+   except NeedsManual:pass
+  if decision is not None:
+   selected='audio';decision['preflight_evidence']=[]
+  else:
+   pilot=visual_segments(folder/'source.video',folder/'frames',runner,representative=True)
+   atomic_json(folder/'recognition.json',{'requested_mode':mode,'preflight_evidence':pilot,'reason':'未确认可靠口播，核验画面字幕','rule_version':'audio-first-v1'})
+   decision=classify_evidence(pilot,'');selected='visual';decision['mode']='visual';decision['preflight_evidence']=pilot
+  decision['rule_version']='audio-first-v1'
+  decision['coverage']={'speech_seconds':30,'visual_only_without_reliable_speech':True}
  decision.update(requested_mode=mode,selected_mode=selected)
  atomic_json(folder/'recognition.json',decision)
  if selected in ('visual','demo'):

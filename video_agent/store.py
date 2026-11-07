@@ -3,6 +3,16 @@ import hashlib,json,sqlite3,threading,uuid,time
 from pathlib import Path
 
 CONFIG_VERSION='whisper-small-v1_qwen-instruct-v1'
+IMPORT_MODES=('auto','audio','visual','demo')
+
+def mode_fingerprint(source_sha,mode):
+    return hashlib.sha256((source_sha+CONFIG_VERSION+"_recognition-v1_"+mode).encode()).hexdigest()
+
+def import_fingerprints(source_sha,mode):
+    # Include the format used before recognition modes were introduced.
+    legacy=hashlib.sha256((source_sha+CONFIG_VERSION).encode()).hexdigest()
+    return [mode_fingerprint(source_sha,mode),*(mode_fingerprint(source_sha,m) for m in IMPORT_MODES if m!=mode),legacy]
+
 ACTIVE=('recognizing','extracting','transcribing','organizing')
 class Store:
     def __init__(self,root):
@@ -46,34 +56,47 @@ class Store:
         fields['updated']=time.time()
         with self.lock:
             self.db.execute('UPDATE jobs SET '+','.join(k+'=?' for k in fields)+' WHERE id=?',(*fields.values(),jid));self.db.commit()
-    def import_file(self,path,name,recognition_mode="auto",force_new=False):
-        if recognition_mode not in ("auto","audio","visual","demo"):raise ValueError("无效识别模式")
+    def import_matches(self,fingerprints):
+        placeholders=','.join('?' for _ in fingerprints)
+        with self.lock:
+            rows=self.db.execute(f'SELECT * FROM jobs WHERE fingerprint IN ({placeholders}) AND trashed_at IS NULL ORDER BY (fingerprint=?) DESC, created DESC',(*fingerprints,fingerprints[0]))
+            return [dict(row) for row in rows]
+    def import_file(self,path,name,recognition_mode="auto",force_new=False,*,dedupe_source=False):
+        if recognition_mode not in IMPORT_MODES:raise ValueError("无效识别模式")
         path=Path(path);h=hashlib.sha256()
         with path.open('rb') as f:
             for chunk in iter(lambda:f.read(1024*1024),b''):h.update(chunk)
-        fingerprint=hashlib.sha256((h.hexdigest()+CONFIG_VERSION+"_recognition-v1_"+recognition_mode).encode()).hexdigest()
+        if (self.root/'deletions'/(h.hexdigest()+'.blocked')).exists():raise ValueError('此视频此前已删除，已阻止重复录入；请先核对删除记录')
+        fingerprints=import_fingerprints(h.hexdigest(),recognition_mode)
+        fingerprint=fingerprints[0]
         with self.lock:
-            old=self.db.execute('SELECT * FROM jobs WHERE fingerprint=? AND trashed_at IS NULL',(fingerprint,)).fetchone()
-            if old and not force_new:path.unlink(missing_ok=True);return dict(old)
+            matches=self.import_matches(fingerprints if dedupe_source else [fingerprint]) if not force_new else []
+            if matches:
+                path.unlink(missing_ok=True)
+                return dict(matches[0],duplicate=True) if dedupe_source else matches[0]
             jid=uuid.uuid4().hex;folder=self.root/'jobs'/jid;folder.mkdir()
             path.replace(folder/'source.video');now=time.time()
             self.db.execute('INSERT INTO jobs(id,fingerprint,name,status,detail,error,created,updated) VALUES (?,?,?,?,?,?,?,?)',(jid,fingerprint,Path(name).name[:200],'queued','等待处理','',now,now));self.db.execute('UPDATE jobs SET recognition_mode=? WHERE id=?',(recognition_mode,jid));self.db.commit()
-        return self.get(jid)
+        job=self.get(jid)
+        return dict(job,duplicate=False) if dedupe_source else job
     def recover(self):
         with self.lock:
-            self.db.execute("UPDATE jobs SET status='interrupted',detail='服务中断，可继续' WHERE status IN ('recognizing','extracting','transcribing','organizing')")
+            self.db.execute("UPDATE jobs SET status='queued',detail='服务恢复，自动从检查点继续' WHERE status IN ('recognizing','extracting','transcribing','organizing')")
             for row in self.db.execute("SELECT id,status FROM jobs WHERE status IN ('publishing','publish_queued')").fetchall():
                 journal=self.root/'jobs'/row['id']/'notion-journal.json'
+                overwrite=journal.with_name('notion-overwrite.json')
+                if overwrite.exists():journal=overwrite
                 try: state=json.loads(journal.read_text()) if journal.exists() else None
                 except (ValueError,OSError):state={'inflight':True}
-                if row['status']=='publish_queued' and state is None:
+                if state is None:
                     plan_path=journal.with_name('publish-plan.json')
                     try:plan=json.loads(plan_path.read_text())
                     except (OSError,ValueError):plan={}
-                    if isinstance(plan,dict) and plan.get('automatic'):continue
+                    if isinstance(plan,dict) and plan.get('target'):
+                        self.db.execute("UPDATE jobs SET status='publish_queued',detail='自动继续已授权写入' WHERE id=?",(row['id'],));continue
                     status,detail='ready','尚未发送写入请求，请重新确认发布'
                 elif state is not None and not state.get('inflight',True):
-                    status,detail='publish_failed','已有写入检查点，可在核对后继续'
+                    status,detail='publish_queued','自动从写入检查点继续'
                 else:status,detail='publish_uncertain','上次写入结果待核对，请先查看Notion'
                 self.db.execute('UPDATE jobs SET status=?,detail=? WHERE id=?',(status,detail,row['id']))
             self.db.commit()
@@ -81,7 +104,7 @@ class Store:
                 p=self.root/'jobs'/row['id']/'notion-refresh.json'
                 try: state=json.loads(p.read_text()) if p.exists() else {}
                 except (ValueError,OSError):state={'inflight':True}
-                status='published' if state.get('done') else ('refresh_uncertain' if state.get('inflight') else 'refresh_failed')
+                status='published' if state.get('done') else ('refresh_uncertain' if state.get('inflight') else 'refresh_queued')
                 self.db.execute('UPDATE jobs SET status=?,detail=? WHERE id=?',(status,'更新中断，请核对后继续',row['id']))
             self.db.commit()
     def retry(self,jid):
