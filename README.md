@@ -2,7 +2,7 @@
 
 片语是一个在 Apple Silicon Mac 上运行的视频文案工作台。导入本地视频或账号文件夹后，片语用 Whisper 转写口播、用本地 Qwen 整理文案与主题，也能在无有效口播时提取画面文字。结果可以在内容库里阅读、编辑和检索，也可以同步到自己的 Notion。
 
-当前发行版为 **0.2.0 Preview**，适用于 macOS 15 或更新版本，使用原生 ARM64 Python 3.12。请从 [GitHub Releases](https://github.com/Formangarden524/pianyu-mac/releases/latest) 下载包含安装脚本的 ZIP，首次安装时另行下载依赖和模型。
+当前发行版为 **0.2.1 Preview**，适用于 macOS 15 或更新版本，使用原生 ARM64 Python 3.12。请从 [GitHub Releases](https://github.com/Formangarden524/pianyu-mac/releases/latest) 下载包含安装脚本的 ZIP，首次安装时另行下载依赖和模型。
 
 ## 界面预览
 

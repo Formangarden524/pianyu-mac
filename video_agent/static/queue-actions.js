@@ -85,13 +85,31 @@ if(typeof document!=='undefined'){
   const ids=queueSelection.snapshot();if(!ids.length||queueBusy||!queueEnabled)return;
   if(!contentLeave(trashSelected))return;
   setQueueBusy(true);
+  const removed=[],failed=[];
+  let checked=0,problem='';
   try{
-   const batch=await api('/api/batch/prepare',{method:'POST',body:JSON.stringify({action:'trash',ids})});
-   const result=await api('/api/batch/'+batch.id+'/commit',{method:'POST',body:JSON.stringify({choices:{}})});
-   const removed=result.items.filter(i=>i.ok).map(i=>i.id),failed=result.items.filter(i=>!i.ok);
-   clearDeletedPreview(removed);for(const id of removed)queueSelection.toggle(id,false);
-   await refresh();toast('已移入回收站 '+removed.length+' 项，可恢复。'+(failed.length?'失败 '+failed.length+' 项：'+failed.map(i=>i.error).join('；'):''));
-  }catch(e){toast(e.message)}finally{setQueueBusy(false)}
+   const groupSize=200;
+   for(let offset=0;offset<ids.length;offset+=groupSize){
+    const group=ids.slice(offset,offset+groupSize);
+    toast('正在移入回收站，已核对 '+checked+' / '+ids.length+' 项');
+    const batch=await api('/api/batch/prepare',{method:'POST',body:JSON.stringify({action:'trash',ids:group})});
+    const result=await api('/api/batch/'+batch.id+'/commit',{method:'POST',body:JSON.stringify({choices:{}})});
+    const completed=result.items.filter(item=>item.ok).map(item=>item.id);
+    removed.push(...completed);
+    failed.push(...result.items.filter(item=>!item.ok));
+    checked+=result.items.length;
+    clearDeletedPreview(completed);
+    for(const id of completed)queueSelection.toggle(id,false);
+   }
+  }catch(e){problem=e.message}
+  finally{
+   await refresh();
+   const reasons=[...new Set(failed.map(item=>item.error).filter(Boolean))];
+   toast('已移入回收站 '+removed.length+' 项，可恢复。'+
+    (failed.length?'未能移入 '+failed.length+' 项。'+reasons.join('。'):'')+
+    (problem?' 另有 '+(ids.length-checked)+' 项未确认结果，请刷新后重试。'+problem:''));
+   setQueueBusy(false);
+  }
  }
  for(const action of ['publish','reprocess'])q('#queue-'+action).onclick=()=>prepare(action);
  q('#queue-trash').onclick=trashSelected;

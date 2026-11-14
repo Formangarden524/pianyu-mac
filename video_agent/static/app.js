@@ -27,7 +27,8 @@ $('#settings-open').onclick=openSettings;$('#settings-top').onclick=openSettings
 $('#settings-form').onsubmit=async e=>{e.preventDefault();$('#save-settings').disabled=true;$('#settings-result').textContent='正在验证目标权限…';try{await api('/api/settings',{method:'POST',body:JSON.stringify({auto_publish:$('#auto-publish').checked,duplicate_policy:$('#duplicate-policy').value,token:$('#notion-token').value,kind:$('#notion-kind').value,target:$('#notion-target').value})});$('#notion-token').value='';$('#token-state').textContent='密钥已安全保存在macOS钥匙串，重启后自动读取。';const d=await api('/api/settings/test',{method:'POST'});$('#settings-result').textContent='✓ 连接成功。'+(d.refresh_queued?'已开始更新 '+d.refresh_queued+' 个原有页面。':'预览后可以写入 Notion。');toast('Notion 连接成功')}catch(e){$('#settings-result').textContent=e.message}finally{$('#save-settings').disabled=false}};
 $('#clear-token').onclick=async()=>{try{await api('/api/settings',{method:'POST',body:JSON.stringify({clear_token:true,kind:$('#notion-kind').value,target:$('#notion-target').value})});$('#notion-token').value='';$('#token-state').textContent='密钥已清除。';$('#settings-result').textContent=''}catch(e){toast(e.message)}};
 async function health(){try{const h=await api('/api/health');folderEnabled=h.folder_import_enabled===true;queueEnabled=h.queue_batch_enabled===true;renderQueueSelection();folderRows();$('#health').textContent=(h.asr_ready?'● Whisper 本地模型已就绪':'○ Whisper 模型未安装，请查看使用指南')+'　·　Qwen：'+h.model+'　·　任务与结果保存在本机'}catch(e){$('#health').textContent='本地服务未连接'}}
-let stagedFolder=[],folderEnabled=false,busy='',generation=0,batch=null;
+let stagedFolder=[],folderEnabled=false,busy='',batch=null,folderQueue=null;
+const folderGroupSize=100;
 const safeHistory=new Set(['ready','published','failed','interrupted','publish_failed','refresh_failed']);
 const canOverwrite=i=>i.matches.length && i.matches.every(j=>safeHistory.has((jobs.find(x=>x.id===j.id)||j).status));
 function folderStatus(){
@@ -35,35 +36,88 @@ function folderStatus(){
  if(!folderEnabled){status.textContent='文件夹导入升级尚未就绪，请在服务升级后刷新页面。';return}
  if(!batch){status.textContent='选择文件夹以扫描视频';return}
  const counts={queued:0,processing:0,success:0,failure:0};
- for(const id of batch.ids){const s=jobs.find(j=>j.id===id)?.status||'queued';
+ const statusById=new Map(jobs.map(job=>[job.id,job.status]));
+ for(const id of batch.ids){const s=statusById.get(id)||'queued';
  const k=['ready','published'].includes(s)?'success':s.endsWith('queued')?'queued':['recognizing','extracting','organizing','transcribing','publishing','refreshing'].includes(s)?'processing':'failure';counts[k]++}
- status.textContent=batch.name+' · '+(busy||batch.note)+' · 已扫描 '+batch.scanned+'/'+batch.total+' · 非视频 '+batch.other+' · 已暂存 '+batch.staged+' · 待提交 '+stagedFolder.length+' · 排队 '+counts.queued+' · 处理中 '+counts.processing+' · 成功 '+counts.success+' · 失败 '+(counts.failure+batch.errors.length+stagedFolder.filter(i=>i.error).length)+' · 跳过 '+batch.skipped;
+ status.textContent=batch.name+' · '+(busy||batch.note)+' · 已扫描 '+batch.scanned+'/'+batch.total+' · 非视频 '+batch.other+' · 已接收 '+batch.staged+' · 待提交 '+stagedFolder.length+' · 排队 '+counts.queued+' · 处理中 '+counts.processing+' · 成功 '+counts.success+' · 失败 '+(counts.failure+batch.errors.length+stagedFolder.filter(i=>i.error).length)+' · 跳过 '+batch.skipped;
 }
-$('#choose-folder').onclick=()=>{if(folderEnabled&&!busy&&!stagedFolder.length)$('#folder-files').click()};
+let chooseFolderForReview=false;
+function chooseFolder(manual){
+ if(!folderEnabled||busy||stagedFolder.length||folderQueue)return;
+ chooseFolderForReview=manual;
+ $('#folder-files').click();
+}
+$('#choose-folder').onclick=()=>chooseFolder(false);
+$('#folder-manual').onclick=()=>chooseFolder(true);
 function folderRows(){const el=$('#folder-manifest');el.replaceChildren();for(const item of stagedFolder){const row=node('div','');row.append(node('span','',item.name+' · '+({auto:'自动',audio:'口播优先',visual:'画面文字优先',demo:'软件演示'}[item.recognition_mode]||'自动')+' · '+(item.matches.length?'已添加 · '+item.matches.map(j=>(labels[j.status]||j.status)+(j.page_id?' · 已关联Notion':'')).join(' / '):'新视频')+' '));const select=node('select');for(const [value,label] of [['new','新增（按自动写入设置）'],['overwrite','覆盖（重处理并更新原Notion）'],['skip','跳过']]){const o=node('option','',label);o.value=value;if(value==='overwrite'&&!canOverwrite(item))o.disabled=true;select.append(o)}select.disabled=!!busy;select.value=item.action;select.onchange=()=>{item.action=select.value;item.allowDuplicate=select.value==='new'};row.append(select);if(item.matches.length){const old=node('select');for(const j of item.matches){const o=node('option','',j.name+' · '+j.status+' · '+j.id.slice(0,8));o.value=j.id;old.append(o)}old.disabled=!!busy;old.value=item.old_id;old.onchange=()=>item.old_id=old.value;row.append(old)}if(item.error)row.append(node('span','',item.error));el.append(row)}
  for(const id of ['new','overwrite','skip','commit','cancel'])$('#folder-'+id).disabled=!folderEnabled||!!busy||!stagedFolder.length;
- $('#choose-folder').disabled=!folderEnabled||!!busy||!!stagedFolder.length;
+ $('#choose-folder').disabled=!folderEnabled||!!busy||!!stagedFolder.length||!!folderQueue;
+ $('#folder-manual').disabled=$('#choose-folder').disabled;
+ $('#folder-continue').hidden=!folderQueue||!!busy||!!stagedFolder.length;
+ $('#folder-cancel').disabled=!folderEnabled||!!busy||(!stagedFolder.length&&!folderQueue);
  $('#folder-errors').replaceChildren(...(batch?.errors||[]).map(msg=>node('div','',msg)));
  $('#folder-errors-panel').hidden=!(batch?.errors?.length);$('#folder-errors-summary').textContent='错误明细（'+(batch?.errors?.length||0)+'）· 点击展开／收起';
  $('#folder-manifest-panel').hidden=!stagedFolder.length;$('#folder-manifest-summary').textContent='待提交文件清单（'+stagedFolder.length+'）· 点击展开后逐项设置';
  folderStatus()}
-$('#folder-files').onchange=async e=>{
- if(!folderEnabled||busy||stagedFolder.length)return;
- const recognitionMode=$('#recognition-mode').value;const seq=++generation,files=[...e.target.files];busy='正在扫描';
- batch={name:files[0]?.webkitRelativePath.split('/')[0]||'文件夹',total:files.length,scanned:0,other:0,staged:0,skipped:0,ids:[],errors:[],note:'请核对清单'};
+$('#folder-files').onchange=e=>{
+ if(!folderEnabled||busy||stagedFolder.length||folderQueue)return;
+ const files=[...e.target.files];
+ e.target.value='';
+ if(!files.length)return;
+ const videos=files.filter(file=>/\.(mp4|mov|mkv|webm)$/i.test(file.name));
+ batch={name:files[0].webkitRelativePath.split('/')[0]||'文件夹',total:files.length,
+  scanned:files.length-videos.length,other:files.length-videos.length,staged:0,skipped:0,
+  ids:[],errors:[],note:'等待导入'};
+ folderQueue={files:videos,next:0,mode:$('#recognition-mode').value,manual:chooseFolderForReview};
+ return importFolderGroup();
+};
+async function importFolderGroup(){
+ if(!folderQueue||busy||stagedFolder.length)return;
+ const queue=folderQueue;
+ busy=queue.manual?'正在暂存本组':'正在逐个加入队列';
  folderRows();
- try{for(const file of files){if(seq!==generation)break;
- const name=file.webkitRelativePath||file.name;batch.scanned++;
- if(!/\.(mp4|mov|mkv|webm)$/i.test(name)){batch.other++;continue}
- try{if(!file.size||file.size>2*1024**3)throw Error('文件为空或超过2GiB');
- const i=await api('/api/folder/stage',{method:'POST',body:file,headers:{'X-Recognition-Mode':recognitionMode,'X-Filename':encodeURIComponent(name),'Content-Type':'application/octet-stream'}});
- i.action=i.matches.length?'skip':'new';i.old_id=i.matches[0]?.id;stagedFolder.push(i);batch.staged++;
- }catch(err){batch.errors.push(name+'：'+err.message)}folderRows()}
- }finally{busy='';e.target.value='';folderRows()}};
+ try{
+  while(queue.next<queue.files.length&&(!queue.manual||stagedFolder.length<folderGroupSize)){
+   const file=queue.files[queue.next];
+   const name=file.webkitRelativePath||file.name;
+   try{
+    if(!file.size||file.size>2*1024**3)throw Error('文件为空或超过2GiB');
+    const author=name.includes('/')?name.split('/').slice(-2,-1)[0]:'';
+    const result=await api(queue.manual?'/api/folder/stage':'/api/upload',{
+     method:'POST',body:file,headers:{
+      'X-Recognition-Mode':queue.mode,
+      'X-Filename':encodeURIComponent(queue.manual?name:file.name),
+      'X-Author':encodeURIComponent(author),
+      'Content-Type':'application/octet-stream',
+     },
+    });
+    batch.staged++;
+    if(queue.manual){
+     result.action=result.matches.length?'skip':'new';
+     result.old_id=result.matches[0]?.id;
+     stagedFolder.push(result);
+    }else if(result.duplicate)batch.skipped++;
+    else batch.ids.push(result.id);
+   }catch(err){
+    if(queue.manual&&err.message.startsWith('暂存上限'))break;
+    batch.errors.push(name+'：'+err.message);
+   }
+   queue.next++;
+   batch.scanned++;
+   folderStatus();
+  }
+  if(queue.next===queue.files.length)folderQueue=null;
+  batch.note=stagedFolder.length?'请核对本组，提交后自动暂存下一组':
+   folderQueue?'暂存区已满，请处理其他待提交项后继续':
+   batch.ids.length?'导入完成，视频已进入处理队列':batch.other===batch.total?'未找到支持的视频':'导入完成';
+  await refresh();
+ }finally{busy='';folderRows()}
+}
+$('#folder-continue').onclick=importFolderGroup;
 for(const action of ['new','overwrite','skip'])$('#folder-'+action).onclick=()=>{if(!folderEnabled||busy)return;for(const i of stagedFolder){i.action=action==='overwrite'&&!canOverwrite(i)?(i.matches.length?'skip':'new'):action;i.allowDuplicate=action==='new'}folderRows()};
 async function finishFolder(cancel){
- if(!folderEnabled||busy||!stagedFolder.length)return;
- ++generation;
+ if(!folderEnabled||busy||(!stagedFolder.length&&!folderQueue))return;
+ if(cancel)folderQueue=null;
  const snapshot=stagedFolder.map(i=>({...i}));
  busy=cancel?'正在取消':'正在核验覆盖目标';folderRows();
  try{
@@ -91,7 +145,9 @@ async function finishFolder(cancel){
  else{const r=await api('/api/folder/'+i.id+'/commit',{method:'POST',body:JSON.stringify({action:i.action,old_id:i.action==='overwrite'?i.old_id:null,check_id:i.check_id,confirmed:true,skip_existing:!i.allowDuplicate})});if(r.skipped)batch.skipped++;else batch.ids.push(r.id)}
  }catch(e){i.error=e.message;remaining.push(i)}}
  stagedFolder=remaining;batch.note=remaining.length?'部分操作失败，请核对清单':cancel?'暂存已取消':batch.ids.length?'已提交':'已跳过，无任务排队';await refresh();
- }finally{busy='';folderRows()}}
+ }finally{busy='';folderRows()}
+ if(!cancel&&!stagedFolder.length&&folderQueue)await importFolderGroup();
+}
 $('#folder-cancel').onclick=()=>finishFolder(true);
 $('#folder-commit').onclick=()=>finishFolder(false);
 folderRows();refresh();health();setInterval(refresh,2500);
